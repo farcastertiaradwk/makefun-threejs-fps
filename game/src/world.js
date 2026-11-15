@@ -2,7 +2,8 @@
 // north-south between the Vanguard spawn (south) and the Sentinel spawn (north): A-long on
 // the west, mid through the centre, B-long on the east. Bomb site A sits in the west yard,
 // site B in the east yard. Every box is a collider for bodies and a surface a bullet stops
-// on. Plain geometry only, no models and no textures; the palette does the styling.
+// on. Plain geometry plus two canvas-painted site signs, no models and no image
+// files; the palette does the styling.
 import * as THREE from 'three';
 import { PALETTE, TEAM } from './palette.js';
 
@@ -146,6 +147,8 @@ export function createWorld(scene) {
   box(1.2, 1.2, 1.2, -9.2, 0.6, -4, olive);
   box(1.2, 1.2, 1.2, -9.85, 1.8, -4, olive);
   box(2.4, 1.1, 1.2, -18, 0.55, -8, materials.hairline);
+  // A lone crate between the west lane and mid, clear of the waypoint lines.
+  box(1.2, 1.2, 1.2, -13, 0.6, 4, olive);
   // B-long (east): mirrored cover.
   box(2.4, 2.6, 6, 20.6, 1.3, 2, teal);
   box(2.4, 2.6, 6, 20.6, 3.9, 2, rust);
@@ -153,6 +156,7 @@ export function createWorld(scene) {
   box(1.2, 1.2, 1.2, 9.2, 0.6, -4, olive);
   box(1.2, 1.2, 1.2, 9.85, 1.8, -4, olive);
   box(2.4, 1.1, 1.2, 18, 0.55, -8, materials.hairline);
+  box(1.2, 1.2, 1.2, 13, 0.6, 4, olive);
 
   // Mid: central pillar hall and low barriers.
   box(1.6, 4.4, 1.6, 0, 2.2, 0, materials.hairline);
@@ -178,6 +182,36 @@ export function createWorld(scene) {
   const plateB = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.06, 3.4), cyanGlow);
   plateB.position.set(15, 0.03, -10);
   group.add(plateB);
+
+  // Site letters: big floating signs above each site, so a player pushing a lane
+  // reads which site it is at a glance — and a screenshot shows it too. Canvas
+  // paint, not a file, so the gate costs nothing; unlit, so they read at dusk.
+  function siteSign(letter, color, x, z) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = 'rgba(26,29,36,0.85)';
+    ctx.fillRect(0, 0, 128, 128);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 6;
+    ctx.strokeRect(4, 4, 120, 120);
+    ctx.fillStyle = color;
+    ctx.font = 'bold 84px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(letter, 64, 70);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    const sign = new THREE.Mesh(
+      new THREE.PlaneGeometry(2.0, 2.0),
+      new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide, transparent: true }),
+    );
+    sign.position.set(x, 3.8, z);
+    group.add(sign);
+  }
+  siteSign('A', '#f0a830', -15, -10);
+  siteSign('B', '#4fc3e8', 15, -10);
 
   // Spawn cover: low walls at both ends.
   box(6, 1.1, 1.2, -4, 0.55, 12.5, materials.hairline);

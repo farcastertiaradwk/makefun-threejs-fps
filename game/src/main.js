@@ -10,13 +10,18 @@
 //   headshots/recoil/spread  shoot() + weapons.js (spread, bloom, recoil)
 //   bot routes/vision/sound  bots.js (waypoint graph, FOV + line of sight, noise)
 //   grenade ................ throwGrenade() + the projectile step below
+//   bot frags .............. bots.js (one frag per bot per round) + launchGrenade()
+//   squad push ............. state.attackSite + bots.js convergence/escort
+//   minimap ................ hud.js setMinimap (canvas, sites, squad, bomb)
+//   autopilot (test hook) .. __autopilot below: routes the player to the site,
+//                            plants, and fights back (aim + fire + reload)
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 import { mulberry32 } from './rng.js';
 import { createState, ECONOMY } from './state.js';
 import { createInput } from './input.js';
 import { createBody } from './player.js';
-import { createWorld } from './world.js';
+import { createWorld, findRoute, nearestWaypoint, waypoint } from './world.js';
 import { createBots, DAMAGE_TORSO, DAMAGE_HEAD, DAMAGE_LEGS } from './bots.js';
 import { createArsenal, WEAPONS, GRENADE } from './weapons.js';
 import { createBomb } from './bomb.js';
@@ -62,8 +67,26 @@ const _target = new THREE.Vector3();
 const _muzzle = new THREE.Vector3();
 const _headCenter = new THREE.Vector3();
 const _torsoCenter = new THREE.Vector3();
-let grenade = null;
-let grenadeMesh = null;
+// Live frags: { position, velocity, fuse, owner: 'player' | bot, mesh }. The player
+// and the bots share one list — a bot's frag flies, bounces and hurts exactly like
+// the player's, and its kills are credited to the bot in the feed.
+const grenades = [];
+
+function launchGrenade(origin, direction, owner) {
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.09, 12, 10),
+    new THREE.MeshStandardMaterial({ color: 0x2c2f36, roughness: 0.6, metalness: 0.3 }),
+  );
+  mesh.visible = true;
+  scene.add(mesh);
+  grenades.push({
+    position: origin.clone(),
+    velocity: direction.clone().multiplyScalar(16).add(new THREE.Vector3(0, 5, 0)),
+    fuse: GRENADE.fuse,
+    owner,
+    mesh,
+  });
+}
 
 const bots = createBots(scene, world, state, random, {
   onBotShot(bot, origin, direction) {
@@ -86,6 +109,12 @@ const bots = createBots(scene, world, state, random, {
     hud.setBomb('');
     hud.feedLine(`${bot.name} defused the device`);
     sim.endRound('sentinel', 'Device defused');
+  },
+  onBotGrenade(bot, targetPos) {
+    // Lobbed at the target's feet with an arc, like the player's throw.
+    const eye = new THREE.Vector3(bot.body.state.position.x, bot.body.state.position.y + 1.5, bot.body.state.position.z);
+    _direction.set(targetPos.x - eye.x, 0, targetPos.z - eye.z).normalize();
+    launchGrenade(eye, _direction, bot);
   },
 });
 
@@ -262,29 +291,18 @@ function shoot(spread) {
 }
 
 function throwGrenade() {
-  if (arsenal.state.grenades <= 0 || state.phase !== 'live' || grenade) return;
+  if (arsenal.state.grenades <= 0 || state.phase !== 'live') return;
+  if (grenades.some((g) => g.owner === 'player')) return; // one player frag in flight
   arsenal.state.grenades -= 1;
   hud.setGrenades(arsenal.state.grenades);
   camera.getWorldDirection(_direction);
-  grenade = {
-    position: camera.position.clone().addScaledVector(_direction, 0.5),
-    velocity: _direction.clone().multiplyScalar(16).add(new THREE.Vector3(0, 5, 0)),
-    fuse: GRENADE.fuse,
-  };
-  if (!grenadeMesh) {
-    grenadeMesh = new THREE.Mesh(
-      new THREE.SphereGeometry(0.09, 12, 10),
-      new THREE.MeshStandardMaterial({ color: 0x2c2f36, roughness: 0.6, metalness: 0.3 }),
-    );
-    scene.add(grenadeMesh);
-  }
-  grenadeMesh.visible = true;
+  launchGrenade(camera.position.clone().addScaledVector(_direction, 0.5), _direction, 'player');
   arsenal.showGrenade();
   setTimeout(() => arsenal.hideGrenade(), 400);
 }
 
-function explodeGrenade() {
-  const point = grenade.position;
+function explodeGrenade(g) {
+  const point = g.position;
   effects.explosion(point);
   audio.explosion();
   pushNoise(point.x, point.z, 30);
@@ -302,47 +320,60 @@ function explodeGrenade() {
     } else {
       const killed = bots.damage(victim.bot, amount, { x: point.x, z: point.z });
       if (killed) {
-        state.kills += 1;
-        state.money += ECONOMY.killReward;
-        hud.feedLine(`You ▸ ${victim.bot.name} (frag)`);
+        if (g.owner === 'player') {
+          state.kills += 1;
+          state.money += ECONOMY.killReward;
+          hud.feedLine(`You ▸ ${victim.bot.name} (frag)`);
+        } else {
+          hud.feedLine(`${g.owner.name} ▸ ${victim.bot.name} (frag)`);
+        }
+        if (state.bombCarrier === victim.bot.id) {
+          state.bombCarrier = null;
+          state.bombDroppedAt = { x: victim.bot.body.state.position.x, z: victim.bot.body.state.position.z };
+          bomb.drop(victim.bot.body.state.position.x, victim.bot.body.state.position.z);
+        }
         sim.checkElimination();
       }
     }
   }
-  grenade = null;
-  grenadeMesh.visible = false;
+  scene.remove(g.mesh);
 }
 
 function stepGrenade(dt) {
-  if (!grenade) return;
-  grenade.fuse -= dt;
-  grenade.velocity.y -= 20 * dt;
-  grenade.position.addScaledVector(grenade.velocity, dt);
-  grenadeMesh.position.copy(grenade.position);
-  // Bounce off the world's boxes, cheaply: test the point against each collider.
-  for (const collider of world.colliders) {
-    if (collider.containsPoint(grenade.position)) {
-      grenade.velocity.multiplyScalar(-0.35);
-      grenade.position.y = Math.max(grenade.position.y, collider.max.y + 0.1);
-      break;
+  for (let i = grenades.length - 1; i >= 0; i -= 1) {
+    const g = grenades[i];
+    g.fuse -= dt;
+    g.velocity.y -= 20 * dt;
+    g.position.addScaledVector(g.velocity, dt);
+    g.mesh.position.copy(g.position);
+    // Bounce off the world's boxes, cheaply: test the point against each collider.
+    for (const collider of world.colliders) {
+      if (collider.containsPoint(g.position)) {
+        g.velocity.multiplyScalar(-0.35);
+        g.position.y = Math.max(g.position.y, collider.max.y + 0.1);
+        break;
+      }
+    }
+    if (g.position.y < 0.09) {
+      g.position.y = 0.09;
+      g.velocity.y = Math.abs(g.velocity.y) * 0.35;
+      g.velocity.x *= 0.7;
+      g.velocity.z *= 0.7;
+    }
+    if (g.fuse <= 0) {
+      grenades.splice(i, 1);
+      explodeGrenade(g);
     }
   }
-  if (grenade.position.y < 0.09) {
-    grenade.position.y = 0.09;
-    grenade.velocity.y = Math.abs(grenade.velocity.y) * 0.35;
-    grenade.velocity.x *= 0.7;
-    grenade.velocity.z *= 0.7;
-  }
-  if (grenade.fuse <= 0) explodeGrenade();
 }
 
-function stepPlayerChannel(dt, keys) {
+function stepPlayerChannel(dt, keys, forceHold = false) {
   const body = player.body.state;
   if (state.phase !== 'live' || !player.alive) {
     state.plantProgress = 0;
     return;
   }
-  const holding = keys.has('KeyE');
+  const holding = keys.has('KeyE') || forceHold;
   // Plant: the carrier, inside a site, bomb not planted.
   if (holding && state.bombCarrier === 'player' && !state.bombPlanted) {
     for (const [siteId, site] of Object.entries(world.sites)) {
@@ -461,11 +492,18 @@ function step(dt) {
   if (state.phase === 'live' || state.phase === 'buy') {
     const look = input.takeLook();
     player.body.look(look.x, look.y);
-    const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
-    const strafe = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+    let forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+    let strafe = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
     const crouch = keys.has('ControlLeft') || keys.has('ControlRight') || keys.has('KeyC');
     const sprint = keys.has('ShiftLeft') || keys.has('ShiftRight');
     const jump = keys.has('Space');
+    let autopilotPlant = false;
+    if (autopilotOn && state.phase === 'live' && player.alive) {
+      const drive = autopilotDrive();
+      forward = drive.forward;
+      strafe = drive.strafe;
+      autopilotPlant = drive.plant;
+    }
     if (player.alive) player.body.step(dt, forward, strafe, crouch, jump, sprint && !crouch);
 
     if (pressed.has('KeyR')) arsenal.reload();
@@ -483,14 +521,15 @@ function step(dt) {
     lastBuyKey = keys.has('KeyB');
 
     if (state.phase === 'live' && player.alive) {
-      const firing = input.state.firing;
+      const firing = autopilotOn ? autopilotFiring : input.state.firing;
       const def = arsenal.def();
       const freshPress = firing && !lastFiring;
       if ((def.auto && firing) || (!def.auto && freshPress)) {
         if (arsenal.ready()) shoot(arsenal.spread(player.body.groundSpeed()));
       }
       lastFiring = firing;
-      stepPlayerChannel(dt, keys);
+      if (autopilotOn && arsenal.state.mag === 0) arsenal.reload();
+      stepPlayerChannel(dt, keys, autopilotPlant);
       // Sniper scope on right mouse.
       const aiming = input.state.aiming && arsenal.def().id === 'sniper';
       hud.setScoped(aiming);
@@ -499,6 +538,17 @@ function step(dt) {
     }
     stepGrenade(dt);
     stepPickup(dt);
+    // The squad follows the carrier: whichever site the carrier walks into
+    // becomes the attack site, so the bots converge on the push, not the plan.
+    if (state.phase === 'live' && player.alive) {
+      for (const [siteId, site] of Object.entries(world.sites)) {
+        if (Math.abs(site.center.x - player.body.state.position.x) < site.half
+          && Math.abs(site.center.z - player.body.state.position.z) < site.half) {
+          state.attackSite = siteId;
+          break;
+        }
+      }
+    }
   } else {
     // Drain mouse look while the menu or an overlay is up, so no stale delta jumps the
     // camera when the round starts.
@@ -521,7 +571,22 @@ function step(dt) {
   else if (state.phase === 'live') hud.setTimer(state.bombPlanted ? state.bombTimer : state.timer, state.bombPlanted ? 'DEVICE' : 'ROUND');
   else hud.setTimer(0, '');
   hud.setSpread(arsenal.spread(player.body.groundSpeed()));
+  updateMinimap(false);
   syncCamera();
+}
+
+// The minimap data, from the live state: the player, the alive Vanguard squad,
+// the carrier, the planted or dropped device. Assembled here so the shot staging
+// can force one final draw after it moves the bots.
+function updateMinimap(force) {
+  hud.setMinimap({
+    player: { x: player.body.state.position.x, z: player.body.state.position.z, yaw: player.body.state.yaw, alive: player.alive },
+    teammates: bots.list.filter((b) => b.team === 'vanguard' && b.alive).map((b) => ({ x: b.body.state.position.x, z: b.body.state.position.z, id: b.id })),
+    carrier: state.bombCarrier,
+    planted: state.bombPlanted,
+    bombSite: state.bombSite,
+    dropped: state.bombDroppedAt,
+  }, force);
 }
 
 function frame(now) {
@@ -611,15 +676,23 @@ function runShot(name) {
     defenders[1].body.state.yaw = 0.4;
     defenders[1].mode = 'hold';
     defenders[1].holdPoint = { x: -3.5, z: -7 };
+    // A third defender holds mid-west at a longer range, so the frame carries
+    // three defenders at three ranges instead of two.
+    defenders[2].body.state.position.set(-4.5, 0, -3.5);
+    defenders[2].body.state.yaw = -2.77;
+    defenders[2].mode = 'hold';
+    defenders[2].holdPoint = { x: -4.5, z: -3.5 };
     settle(20);
     document.getElementById('banner').classList.remove('on');
     const target = defenders[0];
-    aimAt(new THREE.Vector3(target.body.state.position.x, 1.2, target.body.state.position.z));
+    // Aim at head height (1.55): the rifle headshot kills, so the kill feed and
+    // the red kill hitmarker show in the frame.
+    aimAt(new THREE.Vector3(target.body.state.position.x, 1.55, target.body.state.position.z));
     shoot(0);
     // Let the muzzle flash and tracer fade (they live ~0.06s) so the bot and the
     // hitmarker are visible in the capture; the hitmarker holds for 4s in shot mode.
     settle(6);
-    aimAt(new THREE.Vector3(target.body.state.position.x, 1.2, target.body.state.position.z));
+    aimAt(new THREE.Vector3(target.body.state.position.x, 1.55, target.body.state.position.z));
   } else if (name === 'end') {
     state.score.vanguard = 1;
     state.money = 4050;
@@ -630,7 +703,10 @@ function runShot(name) {
     state.bombTimer = 0;
     bomb.plant('A');
     hud.showBuy(false);
-    body.position.set(-11, 0, -5);
+    // Stand back from site A: the site sign is 2 m tall, and from (-11,-5) it
+    // filled the frame and covered the top bar. From here the sign, the fallen
+    // defender and the planted device all read at once.
+    body.position.set(-8, 0, -2);
     const defenders = bots.list.filter((bot) => bot.team === 'sentinel');
     defenders[0].body.state.position.set(-14, 0, -9);
     defenders[0].alive = false;
@@ -648,6 +724,9 @@ function runShot(name) {
   hud.setScore(state.score.vanguard, state.score.sentinel, state.round);
   hud.setAmmo(arsenal.state.mag, arsenal.state.reserve, arsenal.def().name);
   hud.setMoney(state.money);
+  // Force the minimap to the staged positions: the staging moved the bots after
+  // the last throttled draw.
+  updateMinimap(true);
   paintTwiceThenReady();
 }
 
@@ -656,6 +735,125 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+// Headless-test hook: autopilot drives the player like a bot — route to the attack
+// site, plant with E — so a probe can measure bot balance and the objective loop
+// with an active carrier. Off unless a probe enables it; it changes nothing in
+// normal play. Same kind of handle as window.__step above.
+let autopilotOn = false;
+let autopilotRoute = [];
+let autopilotIndex = 0;
+let autopilotSite = null;
+let autopilotFiring = false;
+let autopilotTarget = null; // id of the bot the autopilot is currently engaging
+let autopilotAcquireAt = 0; // elapsed time the current target was acquired
+let autopilotAimOffset = { x: 0, y: 0, z: 0 }; // fixed aim error for the current target
+window.__autopilot = (on) => {
+  autopilotOn = Boolean(on);
+  autopilotRoute = [];
+  autopilotIndex = 0;
+  autopilotSite = null;
+  autopilotFiring = false;
+  autopilotTarget = null;
+  autopilotAcquireAt = 0;
+  autopilotAimOffset = { x: 0, y: 0, z: 0 };
+};
+
+// The probe's stand-in for a human player: route to the attack site, plant with
+// E, and fight back. Before moving, it looks for the nearest alive Sentinel bot
+// inside a ~60° cone with a clear line of fire, aims at its torso and fires
+// through the normal weapon path (same spread, recoil, ammo). Without this the
+// carrier walks a lane unarmed and dies in the first second of live — the probe
+// then measures nothing but a dead player. The player strafes along the route
+// while facing the enemy, like a human peeking a lane: the move direction is
+// converted to facing-relative forward/strafe with the same math the bots use.
+// At a site it plants only when no enemy is in sight; otherwise it holds and
+// fights for the site first.
+function autopilotDrive() {
+  const body = player.body.state;
+  // Acquire: the nearest visible Sentinel in the cone ahead. Calibrated to a
+  // competent human, not an aimbot: a 0.35 s reaction delay before firing on a
+  // newly acquired target, and a fixed ±0.35 m aim offset per target (a human's
+  // aim point on one target is roughly consistent during the engagement). The
+  // uncalibrated version (instant fire, exact torso aim) won 20 of 21 rounds
+  // in the probe — it measured the aimbot, not the game.
+  autopilotFiring = false;
+  const eye = new THREE.Vector3(body.position.x, body.position.y + body.eye, body.position.z);
+  let best = null;
+  let bestDist = Infinity;
+  let bestBot = null;
+  for (const bot of bots.list) {
+    if (bot.team !== 'sentinel' || !bot.alive) continue;
+    const target = new THREE.Vector3(bot.body.state.position.x, bot.body.state.position.y + 1.2, bot.body.state.position.z);
+    const toTarget = target.clone().sub(eye);
+    const dist = toTarget.length();
+    if (dist > 45 || dist < 1) continue;
+    const dir = toTarget.normalize();
+    const forward = new THREE.Vector3(-Math.sin(body.yaw), 0, -Math.cos(body.yaw));
+    if (forward.dot(dir) < 0.5) continue; // more than ~60° off the facing
+    _raycasterSet(eye, dir, dist);
+    if (raycaster.intersectObjects(world.shootables, false)[0]) continue; // no line of fire
+    if (dist < bestDist) { bestDist = dist; best = target; bestBot = bot; }
+  }
+  if (best) {
+    if (autopilotTarget !== bestBot.id) {
+      autopilotTarget = bestBot.id;
+      autopilotAcquireAt = state.elapsed;
+      autopilotAimOffset = {
+        x: (random() * 2 - 1) * 0.35,
+        y: (random() * 2 - 1) * 0.35,
+        z: (random() * 2 - 1) * 0.35,
+      };
+    }
+    const aim = new THREE.Vector3(
+      best.x + autopilotAimOffset.x,
+      best.y + autopilotAimOffset.y,
+      best.z + autopilotAimOffset.z,
+    );
+    const adx = aim.x - eye.x;
+    const adz = aim.z - eye.z;
+    const aimDist = Math.hypot(adx, aim.y - eye.y, adz);
+    body.yaw = Math.atan2(-adx, -adz);
+    body.pitch = Math.asin(Math.max(-1, Math.min(1, (aim.y - eye.y) / aimDist)));
+    if (state.elapsed - autopilotAcquireAt >= 0.35) autopilotFiring = true;
+  } else {
+    autopilotTarget = null;
+  }
+  const site = world.sites[state.attackSite];
+  if (Math.abs(site.center.x - body.position.x) < site.half
+    && Math.abs(site.center.z - body.position.z) < site.half) {
+    // Inside the site: plant when the site is clear, fight for it otherwise.
+    return best
+      ? { forward: 0, strafe: 0, plant: false }
+      : { forward: 0, strafe: 0, plant: true };
+  }
+  if (autopilotSite !== state.attackSite) {
+    autopilotSite = state.attackSite;
+    autopilotRoute = [];
+    autopilotIndex = 0;
+  }
+  if (!autopilotRoute.length || autopilotIndex >= autopilotRoute.length) {
+    autopilotRoute = findRoute(nearestWaypoint(body.position.x, body.position.z), state.attackSite === 'A' ? 'siteA' : 'siteB');
+    autopilotIndex = 0;
+  }
+  const node = waypoint(autopilotRoute[autopilotIndex]);
+  if (!node) return { forward: 0, strafe: 0, plant: false };
+  const dx = node.x - body.position.x;
+  const dz = node.z - body.position.z;
+  if (Math.hypot(dx, dz) < 1.2) {
+    autopilotIndex += 1;
+    return { forward: 0, strafe: 0, plant: false };
+  }
+  if (!best) body.yaw = Math.atan2(-dx, -dz);
+  // Move along the route, expressed relative to the facing (the facing may be
+  // the enemy, not the route).
+  const len = Math.hypot(dx, dz);
+  const nx = dx / len;
+  const nz = dz / len;
+  const sin = Math.sin(body.yaw);
+  const cos = Math.cos(body.yaw);
+  return { forward: -sin * nx - cos * nz, strafe: cos * nx - sin * nz, plant: false };
+}
 
 // Debug handle for headless tests: window.__game exposes the live state.
 window.__game = { state, bots, player, sim, arsenal };

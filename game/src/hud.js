@@ -44,6 +44,11 @@ export function createHud() {
   const buyPanel = $('buy');
   const buyGrid = $('buy-grid');
   const buyMoney = $('buy-money');
+  const minimap = $('minimap');
+  const minimapCtx = minimap ? minimap.getContext('2d') : null;
+  // Map bounds, in metres: the yard is 44 x 36, x in [-22, 22], z in [-18, 18].
+  const MAP = { x0: -22, x1: 22, z0: -18, z1: 18, w: 150, h: 123 };
+  let lastMinimapDraw = 0;
 
   let lastHealth = -1;
   let lastArmor = -1;
@@ -175,6 +180,85 @@ export function createHud() {
     setSpread(spread) {
       const gap = Math.round(4 + spread * 900);
       crosshair.style.setProperty('--gap', `${Math.min(26, gap)}px`);
+    },
+    // Minimap: the yard from above — walls, the two site plates, the squad, the
+    // carrier and the bomb. Enemies are never shown: no wallhack, ever. Drawn at
+    // most every 100 ms; a steady minimap costs no layout work. `force` draws at
+    // once: the shot staging calls it after moving the bots.
+    setMinimap(data, force = false) {
+      if (!minimapCtx) return;
+      const now = performance.now();
+      if (!force && now - lastMinimapDraw < 100) return;
+      lastMinimapDraw = now;
+      const px = (x) => ((x - MAP.x0) / (MAP.x1 - MAP.x0)) * MAP.w;
+      const pz = (z) => ((z - MAP.z0) / (MAP.z1 - MAP.z0)) * MAP.h;
+      const ctx = minimapCtx;
+      ctx.clearRect(0, 0, MAP.w, MAP.h);
+      ctx.fillStyle = 'rgba(35,38,46,0.85)';
+      ctx.fillRect(0, 0, MAP.w, MAP.h);
+      ctx.strokeStyle = '#3a3f4a';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(1, 1, MAP.w - 2, MAP.h - 2);
+      // Site plates: A amber (west), B cyan (east).
+      ctx.fillStyle = '#f0a830';
+      ctx.fillRect(px(-17.5), pz(-12.5), px(-12.5) - px(-17.5), pz(-7.5) - pz(-12.5));
+      ctx.fillStyle = '#4fc3e8';
+      ctx.fillRect(px(12.5), pz(-12.5), px(17.5) - px(12.5), pz(-7.5) - pz(-12.5));
+      ctx.fillStyle = '#1a1d24';
+      ctx.font = 'bold 10px ui-monospace, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('A', px(-15), pz(-10));
+      ctx.fillText('B', px(15), pz(-10));
+      // Mid pillar.
+      ctx.fillStyle = '#3a3f4a';
+      ctx.fillRect(px(-0.8), pz(-0.8), px(0.8) - px(-0.8), pz(0.8) - pz(-0.8));
+      // Dropped device.
+      if (data.dropped) {
+        ctx.fillStyle = '#ffe08a';
+        ctx.beginPath();
+        ctx.arc(px(data.dropped.x), pz(data.dropped.z), 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Planted device: flashing red on its site.
+      if (data.planted && data.bombSite) {
+        const site = data.bombSite === 'A' ? { x: -15, z: -10 } : { x: 15, z: -10 };
+        ctx.fillStyle = Math.floor(now / 250) % 2 === 0 ? '#ff5a4e' : '#e9e6df';
+        ctx.beginPath();
+        ctx.arc(px(site.x), pz(site.z), 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Squad: amber dots; the carrier gets a ring.
+      for (const mate of data.teammates) {
+        ctx.fillStyle = '#f0a830';
+        ctx.beginPath();
+        ctx.arc(px(mate.x), pz(mate.z), 3, 0, Math.PI * 2);
+        ctx.fill();
+        if (data.carrier === mate.id) {
+          ctx.strokeStyle = '#e9e6df';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(px(mate.x), pz(mate.z), 5.5, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+      // The player: white arrow, pointing where they look. Canvas +y is south
+      // (z grows downward), so rotate by -yaw: yaw 0 faces north, up the map.
+      if (data.player.alive) {
+        const x = px(data.player.x);
+        const y = pz(data.player.z);
+        ctx.fillStyle = '#e9e6df';
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(-data.player.yaw);
+        ctx.beginPath();
+        ctx.moveTo(0, -6);
+        ctx.lineTo(4.5, 5);
+        ctx.lineTo(-4.5, 5);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
     },
     setScoped(on) {
       scope.hidden = !on;

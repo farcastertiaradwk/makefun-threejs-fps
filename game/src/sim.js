@@ -26,6 +26,10 @@ export function createSim(state, deps) {
     state.defuseProgress = 0;
     state.bombCarrier = 'player';
     state.bombDroppedAt = null;
+    // The squad pushes one site together, alternating by round; a human who walks
+    // into the other site re-points the squad (see main.js: attackSite follows the
+    // carrier). A split 2+2 attack bled rounds to the defenders.
+    state.attackSite = state.round % 2 === 1 ? 'A' : 'B';
     state.roundKills = 0;
     state.roundWinner = null;
     state.roundReason = '';

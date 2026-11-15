@@ -11,8 +11,6 @@ import { findRoute, nearestWaypoint, waypoint } from './world.js';
 import { range } from './rng.js';
 
 const BOT_HEALTH = 100;
-const BOT_SPEED_WALK = 4.4;
-const BOT_SPEED_ENGAGE = 2.6;
 const FOV_COS = Math.cos((100 * Math.PI) / 360);
 const VISION_RANGE = 42;
 const HEAR_RADIUS = 20;
@@ -116,6 +114,10 @@ export function createBots(scene, world, state, rng, events) {
       lastX: spawn[0],
       lastZ: spawn[1],
       stuckTimer: 0,
+      engageStuckTimer: 0, // time spent trying to close in without moving (see engage)
+      noEngageUntil: 0, // cooldown after the engage-stuck fallback, so the bot routes first
+      grenades: 1, // one frag per round; spent on a distant target (see engage)
+      grenadeAt: 0, // next time this bot may throw
       actionProgress: 0,
       actionTarget: null,
       alertPos: null,
@@ -149,10 +151,11 @@ export function createBots(scene, world, state, rng, events) {
     for (const bot of list) scene.remove(bot.group);
     list.length = 0;
     hitMeshes.length = 0;
-    const sites = ['A', 'B'];
+    // The squad pushes one site together (state.attackSite), not a split 2+2:
+    // a split attack bled rounds to the defenders, who held both sites.
     for (let i = 0; i < 4; i += 1) {
       const bot = buildBot('vanguard', i, world.spawns.vanguard[i]);
-      assignRoute(bot, sites[i % 2]);
+      assignRoute(bot, state.attackSite);
     }
     for (let i = 0; i < 5; i += 1) {
       const bot = buildBot('sentinel', i, world.spawns.sentinel[i]);
@@ -241,14 +244,24 @@ export function createBots(scene, world, state, rng, events) {
       // Bots only acquire targets while the round is live: during the buy phase they
       // pre-position and do not fight, and a round that ends drops them out of engage.
       let bestDistance = Infinity;
+      // After the engage-stuck fallback the bot pushes for a few seconds and
+      // only fights what is close, or it would re-engage the same visible
+      // target through the same wall and never get around it.
       if (state.phase === 'live') {
         // The carrier's job is the site, not a duel: it only engages close threats.
-        const maxRange = state.bombCarrier === bot.id ? 10 : Infinity;
+        const maxRange = state.bombCarrier === bot.id ? 10
+          : (time < bot.noEngageUntil ? 12 : Infinity);
         // The player is the only vanguard body the bots can see directly. Note the
         // argument here is the whole player ({ body, alive }), not just the body
         // state: the scan needs player.alive, and passing only the body state made
         // the bots blind to the player entirely.
-        if (player.alive) {
+        // Only Sentinel bots acquire the player: the player is Vanguard, and
+        // letting Vanguard bots target the player made the player's own
+        // squadmates gun them down at spawn in the first second of live — they
+        // stand 1.5–4 m away, inside the bots' field of view, and the player
+        // was the nearest "target". Proven by probe: "Heron ▸ You", and Heron
+        // is a Vanguard bot.
+        if (bot.team === 'sentinel' && player.alive) {
           const distance = canSee(bot, player.body.state.position, 1.2);
           if (distance !== null && distance < bestDistance && distance < maxRange) {
             bestDistance = distance;
@@ -308,9 +321,17 @@ export function createBots(scene, world, state, rng, events) {
       }
     }
 
+    // Squad convergence: Vanguard pushes the attack site together. When the attack
+    // site moves (the carrier walked into the other site), re-route — unless this
+    // bot is fetching the device, carrying it, or fighting.
+    if (bot.team === 'vanguard' && bot.mode !== 'engage' && !bot.fetchTarget
+      && state.bombCarrier !== bot.id && bot.routeTarget !== state.attackSite
+      && bot.routeTarget !== 'bomb') {
+      assignRoute(bot, state.attackSite);
+    }
+
     let moveX = 0;
     let moveZ = 0;
-    let speed = BOT_SPEED_WALK;
     let wantYaw = null;
 
     if (bot.mode === 'engage' && bot.target) {
@@ -323,11 +344,47 @@ export function createBots(scene, world, state, rng, events) {
       if (distance > 12) {
         moveX = targetPos.x - body.position.x;
         moveZ = targetPos.z - body.position.z;
+        // Stuck on a wall while closing in: the straight line to the target
+        // crosses a barrier the bot cannot walk through — the low spawn
+        // barriers at z=12.5 stop a straight push (the bot can see and shoot
+        // over them, eye 1.53 m vs a 1.1 m wall) but not the waypoint graph,
+        // which threads the mid gap. Fall back to routing so the waypoints
+        // carry the bot around the obstacle; for the next 6 s it only fights
+        // what is close (see the scan's maxRange), instead of stopping to
+        // duel the same distant target through the same wall. Only when
+        // closing in (distance > 12): a bot holding ground at range is not
+        // stuck.
+        const moved = Math.hypot(body.position.x - bot.lastX, body.position.z - bot.lastZ);
+        if (moved < 0.02) {
+          bot.engageStuckTimer += dt;
+          if (bot.engageStuckTimer > 1.5) {
+            bot.engageStuckTimer = 0;
+            bot.target = null;
+            bot.lastTarget = null;
+            bot.noEngageUntil = time + 6;
+            if (bot.team === 'vanguard' && bot.targetSite) {
+              assignRoute(bot, bot.targetSite);
+            } else if (bot.team === 'sentinel' && bot.holdPoint) {
+              const from = nearestWaypoint(body.position.x, body.position.z);
+              const to = nearestWaypoint(bot.holdPoint.x, bot.holdPoint.z);
+              bot.route = findRoute(from, to);
+              bot.routeIndex = 0;
+              bot.routeTarget = bot.targetSite;
+              bot.mode = 'route';
+            }
+          }
+        } else bot.engageStuckTimer = 0;
       } else if (distance < 4) {
         moveX = -(targetPos.x - body.position.x);
         moveZ = -(targetPos.z - body.position.z);
       }
-      speed = BOT_SPEED_ENGAGE;
+      // Frag: a bot holding a grenade lobs it at a distant target rifle fire
+      // cannot finish — entrenched defenders, long lanes. One per round.
+      if (bot.grenades > 0 && distance > 12 && time >= bot.grenadeAt) {
+        bot.grenades -= 1;
+        bot.grenadeAt = time + 20;
+        events.onBotGrenade(bot, { x: targetPos.x, z: targetPos.z });
+      }
       // Fire in bursts once the reaction time has passed.
       if (time >= bot.reactionAt) {
         if (bot.burstLeft <= 0 && bot.pauseTimer <= 0) {
@@ -386,8 +443,6 @@ export function createBots(scene, world, state, rng, events) {
           bot.routeIndex += 1;
         }
       } else bot.stuckTimer = 0;
-      bot.lastX = body.position.x;
-      bot.lastZ = body.position.z;
     } else if (bot.mode === 'hold' && bot.holdPoint) {
       const dx = bot.holdPoint.x - body.position.x;
       const dz = bot.holdPoint.z - body.position.z;
@@ -469,6 +524,24 @@ export function createBots(scene, world, state, rng, events) {
       wantYaw = Math.atan2(-(bot.alertPos.x - body.position.x), -(bot.alertPos.z - body.position.z));
     }
 
+    // Separation: squadmates on a route keep ~3 m apart instead of stacking on
+    // one waypoint line — a stacked squad is one frag grenade's worth of kills,
+    // and stacked bodies block each other's line of fire. Not while planting or
+    // defusing (actionProgress > 0): the carrier must stand still to plant.
+    if (bot.mode === 'route' && bot.actionProgress === 0) {
+      for (const other of list) {
+        if (other === bot || other.team !== bot.team || !other.alive) continue;
+        const dx = body.position.x - other.body.state.position.x;
+        const dz = body.position.z - other.body.state.position.z;
+        const d = Math.hypot(dx, dz);
+        if (d > 0.01 && d < 3) {
+          const push = (3 - d) / 3;
+          moveX += (dx / d) * push;
+          moveZ += (dz / d) * push;
+        }
+      }
+    }
+
     // Turn smoothly toward the wanted yaw, then walk.
     if (wantYaw !== null) {
       let diff = wantYaw - body.yaw;
@@ -491,6 +564,10 @@ export function createBots(scene, world, state, rng, events) {
       strafe *= scale;
     }
     bot.body.step(dt, forward, strafe, false, false, false);
+    // Last position, for the stuck detectors (route mode and engage mode both
+    // measure movement since the previous step).
+    bot.lastX = body.position.x;
+    bot.lastZ = body.position.z;
 
     // Walk cycle and facing.
     bot.walkPhase += dt * (bot.body.groundSpeed() * 1.6);

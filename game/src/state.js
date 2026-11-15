@@ -19,6 +19,7 @@ export function createState() {
     defuseProgress: 0,
     bombCarrier: 'player', // 'player' | bot id | null (dropped)
     bombDroppedAt: null,
+    attackSite: 'A', // the site Vanguard pushes this round; the squad converges on it
     roundWinner: null,
     roundReason: '',
     matchWinner: null,
